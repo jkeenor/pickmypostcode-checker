@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError, HTTPError
-from urllib.parse import quote_plus, urlencode, urlparse
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 DEFAULT_URL_TEMPLATE = "https://pickmypostcode.com/api/index.php/entry/current/{entry_id}"
 DEFAULT_MATCH_TEXT = "No results found"
 DEFAULT_ENTRY_ID = "27079"
+DEFAULT_SURVEY_URL = "https://pickmypostcode.com/survey-draw/"
+DEFAULT_SURVEY_ANSWERS_JSON = json.dumps({"radio-1": "neither"})
 DEFAULT_HTTP_PORT = 8080
 DEFAULT_REQUEST_TIMEOUT = 20
 PUSHOVER_ENDPOINT = "https://api.pushover.net/1/messages.json"
@@ -128,6 +130,8 @@ class Config:
     pushover_title: str
     pushover_url: str
     pushover_url_title: str
+    survey_url: str
+    survey_answers: dict[str, str]
 
     @property
     def tz(self) -> ZoneInfo:
@@ -154,15 +158,33 @@ class CheckSnapshot:
     error: str | None = None
 
 
+@dataclass
+class SurveySnapshot:
+    attempted_at: str
+    url: str
+    answers: dict[str, str]
+    submitted_url: str
+    title: str
+    excerpt: str
+    status: str
+    http_status: int | None
+    error: str | None = None
+
+
 class AppState:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.lock = threading.Lock()
         self.snapshot: CheckSnapshot | None = None
+        self.survey_snapshot: SurveySnapshot | None = None
         self.last_raw_body: str = ""
         self.last_notification_signature: str = ""
         self.last_notification_at: str = ""
         self.last_notification_error: str = ""
+        self.last_survey_raw_body: str = ""
+        self.last_survey_signature: str = ""
+        self.last_survey_at: str = ""
+        self.last_survey_error: str = ""
         self.load()
 
     def load(self) -> None:
@@ -175,25 +197,41 @@ class AppState:
 
         try:
             self.snapshot = CheckSnapshot(**data["snapshot"])
+            survey_snapshot = data.get("survey_snapshot")
+            self.survey_snapshot = SurveySnapshot(**survey_snapshot) if survey_snapshot else None
             self.last_raw_body = data.get("last_raw_body", "")
             self.last_notification_signature = data.get("last_notification_signature", "")
             self.last_notification_at = data.get("last_notification_at", "")
             self.last_notification_error = data.get("last_notification_error", "")
+            self.last_survey_raw_body = data.get("last_survey_raw_body", "")
+            self.last_survey_signature = data.get("last_survey_signature", "")
+            self.last_survey_at = data.get("last_survey_at", "")
+            self.last_survey_error = data.get("last_survey_error", "")
         except Exception:
             self.snapshot = None
+            self.survey_snapshot = None
             self.last_raw_body = ""
             self.last_notification_signature = ""
             self.last_notification_at = ""
             self.last_notification_error = ""
+            self.last_survey_raw_body = ""
+            self.last_survey_signature = ""
+            self.last_survey_at = ""
+            self.last_survey_error = ""
 
     def save(self) -> None:
         self.config.state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "snapshot": asdict(self.snapshot) if self.snapshot else None,
+            "survey_snapshot": asdict(self.survey_snapshot) if self.survey_snapshot else None,
             "last_raw_body": self.last_raw_body[-20000:],
             "last_notification_signature": self.last_notification_signature,
             "last_notification_at": self.last_notification_at,
             "last_notification_error": self.last_notification_error,
+            "last_survey_raw_body": self.last_survey_raw_body[-20000:],
+            "last_survey_signature": self.last_survey_signature,
+            "last_survey_at": self.last_survey_at,
+            "last_survey_error": self.last_survey_error,
         }
         tmp = self.config.state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
@@ -205,9 +243,30 @@ class AppState:
             self.last_raw_body = raw_body
             self.save()
 
+    def update_survey(
+        self,
+        snapshot: SurveySnapshot,
+        raw_body: str,
+        *,
+        successful: bool = False,
+    ) -> None:
+        with self.lock:
+            self.survey_snapshot = snapshot
+            if successful:
+                self.last_survey_signature = survey_signature(snapshot)
+                self.last_survey_at = snapshot.attempted_at
+                self.last_survey_error = ""
+            if raw_body:
+                self.last_survey_raw_body = raw_body
+            self.save()
+
     def current(self) -> CheckSnapshot | None:
         with self.lock:
             return self.snapshot
+
+    def current_survey(self) -> SurveySnapshot | None:
+        with self.lock:
+            return self.survey_snapshot
 
 
 def build_check_url(template: str, postcode: str, entry_id: str) -> str:
@@ -216,6 +275,14 @@ def build_check_url(template: str, postcode: str, entry_id: str) -> str:
     if "{postcode_raw}" in template:
         url = url.replace("{postcode_raw}", quote_plus(postcode))
     return url.replace("{postcode}", encoded)
+
+
+def build_survey_url(base_url: str, answers: dict[str, str]) -> str:
+    parts = urlsplit(base_url)
+    query_items = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query_items.update(answers)
+    query = urlencode(query_items)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 def fetch_url(url: str, timeout: int) -> tuple[int, str]:
@@ -255,6 +322,26 @@ def parse_json_document(body: str) -> Any | None:
         return json.loads(body)
     except json.JSONDecodeError:
         return None
+
+
+def parse_json_map(value: str, env_name: str) -> dict[str, str]:
+    value = value.strip()
+    if not value:
+        return {}
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{env_name} must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"{env_name} must be a JSON object")
+    result: dict[str, str] = {}
+    for key, item in payload.items():
+        if not isinstance(key, str) or not key.strip():
+            raise SystemExit(f"{env_name} must contain string keys")
+        if not isinstance(item, str):
+            raise SystemExit(f"{env_name} must contain string values")
+        result[key.strip()] = item.strip()
+    return result
 
 
 def postcode_pattern(postcode: str) -> re.Pattern[str]:
@@ -361,6 +448,11 @@ def render_json_excerpt(payload: Any) -> str:
     return json.dumps(summary, indent=2, sort_keys=True)
 
 
+def render_html_excerpt(body: str, limit: int = 240) -> str:
+    text = html_to_text(body)
+    return make_excerpt(text, "", limit)
+
+
 def notification_signature(snapshot: CheckSnapshot) -> str:
     return "|".join(
         [
@@ -368,6 +460,15 @@ def notification_signature(snapshot: CheckSnapshot) -> str:
             snapshot.matched_text,
             snapshot.url,
             snapshot.status,
+        ]
+    )
+
+
+def survey_signature(snapshot: SurveySnapshot) -> str:
+    return "|".join(
+        [
+            snapshot.url,
+            json.dumps(snapshot.answers, sort_keys=True),
         ]
     )
 
@@ -418,6 +519,112 @@ def send_pushover_notification(config: Config, snapshot: CheckSnapshot, state: A
         state.last_notification_error = str(exc)
         state.save()
         print(f"[pushover] notification failed: {exc}", flush=True)
+
+
+def run_survey(config: Config, state: AppState) -> SurveySnapshot:
+    attempted_at = local_now(config.tz)
+    submitted_url = build_survey_url(config.survey_url, config.survey_answers)
+    title = "Pick My Postcode survey"
+    excerpt = ""
+    status = "disabled"
+    http_status: int | None = None
+    error: str | None = None
+    body = ""
+
+    if not config.survey_answers:
+        snapshot = SurveySnapshot(
+            attempted_at=attempted_at.isoformat(),
+            url=config.survey_url,
+            answers={},
+            submitted_url=submitted_url,
+            title=title,
+            excerpt="",
+            status=status,
+            http_status=http_status,
+            error=error,
+        )
+        state.update_survey(snapshot, "")
+        return snapshot
+
+    existing = state.current_survey()
+    if existing is not None and state.last_survey_at:
+        try:
+            last_attempt = datetime.fromisoformat(state.last_survey_at)
+        except ValueError:
+            last_attempt = None
+        if last_attempt is not None and last_attempt.date() == attempted_at.date() and state.last_survey_signature == survey_signature(config.survey_url, config.survey_answers):
+            snapshot = SurveySnapshot(
+                attempted_at=attempted_at.isoformat(),
+                url=config.survey_url,
+                answers=dict(config.survey_answers),
+                submitted_url=submitted_url,
+                title=existing.title,
+                excerpt=existing.excerpt,
+                status="already_submitted_today",
+                http_status=existing.http_status,
+                error=None,
+            )
+            state.update_survey(snapshot, state.last_survey_raw_body)
+            return snapshot
+
+    try:
+        http_status, body = fetch_url(config.survey_url, config.request_timeout)
+        page_title_match = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+        if page_title_match:
+            title = html.unescape(page_title_match.group(1)).strip()
+        excerpt = render_html_excerpt(body)
+
+        if http_status >= 400:
+            raise RuntimeError(f"HTTP {http_status}")
+
+        http_status, body = fetch_url(submitted_url, config.request_timeout)
+        page_title_match = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+        if page_title_match:
+            title = html.unescape(page_title_match.group(1)).strip()
+        excerpt = render_html_excerpt(body)
+        if http_status >= 400:
+            raise RuntimeError(f"HTTP {http_status}")
+
+        status = "submitted"
+        snapshot = SurveySnapshot(
+            attempted_at=attempted_at.isoformat(),
+            url=config.survey_url,
+            answers=dict(config.survey_answers),
+            submitted_url=submitted_url,
+            title=title,
+            excerpt=excerpt,
+            status=status,
+            http_status=http_status,
+            error=None,
+        )
+        state.update_survey(snapshot, body, successful=True)
+        print(f"[survey] submitted answers for {config.survey_url}", flush=True)
+        return snapshot
+    except HTTPError as exc:
+        error = f"HTTP error {exc.code}: {exc.reason}"
+        status = "error"
+        http_status = exc.code
+    except URLError as exc:
+        error = f"Network error: {exc.reason}"
+        status = "error"
+    except Exception as exc:
+        error = f"Unexpected error: {exc}"
+        status = "error"
+
+    snapshot = SurveySnapshot(
+        attempted_at=attempted_at.isoformat(),
+        url=config.survey_url,
+        answers=dict(config.survey_answers),
+        submitted_url=submitted_url,
+        title=title,
+        excerpt=excerpt,
+        status=status,
+        http_status=http_status,
+        error=error,
+    )
+    state.update_survey(snapshot, body if body else "")
+    print(f"[survey] submission failed: {error}", flush=True)
+    return snapshot
 
 
 def run_check(config: Config, state: AppState) -> CheckSnapshot:
@@ -490,32 +697,44 @@ def run_check(config: Config, state: AppState) -> CheckSnapshot:
     return snapshot
 
 
-def format_snapshot(snapshot: CheckSnapshot | None, config: Config) -> dict[str, Any]:
-    if snapshot is None:
-        now = local_now(config.tz)
-        next_check = next_run_at(now, *config.schedule)
-        return {
-            "status": "idle",
-            "postcode": pretty_postcode(config.postcode),
-            "check_time": config.check_time,
-            "timezone": config.timezone,
-        "check_url_template": config.check_url_template,
-        "entry_id": config.entry_id,
-        "pushover_enabled": bool(config.pushover_app_token and config.pushover_user_key),
-        "next_check_at": next_check.isoformat(),
-    }
+def format_dashboard(
+    check_snapshot: CheckSnapshot | None,
+    survey_snapshot: SurveySnapshot | None,
+    config: Config,
+) -> dict[str, Any]:
+    now = local_now(config.tz)
+    next_check = next_run_at(now, *config.schedule)
     return {
-        **asdict(snapshot),
+        "status": check_snapshot.status if check_snapshot else "idle",
+        "postcode": pretty_postcode(config.postcode),
         "check_time": config.check_time,
         "timezone": config.timezone,
         "check_url_template": config.check_url_template,
         "entry_id": config.entry_id,
         "pushover_enabled": bool(config.pushover_app_token and config.pushover_user_key),
+        "survey_enabled": bool(config.survey_answers),
+        "survey_url": config.survey_url,
+        "next_check_at": (check_snapshot.next_check_at if check_snapshot and check_snapshot.next_check_at else next_check.isoformat()),
+        "check": asdict(check_snapshot) if check_snapshot else None,
+        "survey": asdict(survey_snapshot) if survey_snapshot else None,
     }
 
 
 def render_html(snapshot: dict[str, Any]) -> str:
-    safe = {k: html.escape("" if v is None else str(v)) for k, v in snapshot.items()}
+    check = snapshot.get("check") or {}
+    survey = snapshot.get("survey") or {}
+    safe = {
+        "status": html.escape("" if snapshot.get("status") is None else str(snapshot.get("status"))),
+        "postcode": html.escape("" if snapshot.get("postcode") is None else str(snapshot.get("postcode"))),
+        "check_time": html.escape("" if snapshot.get("check_time") is None else str(snapshot.get("check_time"))),
+        "timezone": html.escape("" if snapshot.get("timezone") is None else str(snapshot.get("timezone"))),
+        "check_url_template": html.escape("" if snapshot.get("check_url_template") is None else str(snapshot.get("check_url_template"))),
+        "entry_id": html.escape("" if snapshot.get("entry_id") is None else str(snapshot.get("entry_id"))),
+        "pushover_enabled": html.escape("" if snapshot.get("pushover_enabled") is None else str(snapshot.get("pushover_enabled"))),
+        "survey_enabled": html.escape("" if snapshot.get("survey_enabled") is None else str(snapshot.get("survey_enabled"))),
+        "survey_url": html.escape("" if snapshot.get("survey_url") is None else str(snapshot.get("survey_url"))),
+        "next_check_at": html.escape("" if snapshot.get("next_check_at") is None else str(snapshot.get("next_check_at"))),
+    }
     badge_class = {
         "error": "bad",
         "no_results": "neutral",
@@ -652,7 +871,7 @@ def render_html(snapshot: dict[str, Any]) -> str:
       <div class="panel">
         <div class="badge {badge_class}">{safe['status']}</div>
         <h1>Pick My Postcode checker</h1>
-        <p class="lede">This container checks the live Pick My Postcode current-draw API for <code>{safe['postcode']}</code> on the schedule you set in the stack.</p>
+        <p class="lede">This container checks the live Pick My Postcode current-draw API for <code>{safe['postcode']}</code> and submits the daily survey on the schedule you set in the stack.</p>
         <p class="foot">Next run: <code>{safe.get('next_check_at', '')}</code></p>
       </div>
       <div class="panel">
@@ -662,19 +881,29 @@ def render_html(snapshot: dict[str, Any]) -> str:
           <div class="stat"><dt>Target URL</dt><dd>{safe['check_url_template']}</dd></div>
           <div class="stat"><dt>Entry ID</dt><dd>{safe['entry_id']}</dd></div>
           <div class="stat"><dt>Pushover</dt><dd>{safe['pushover_enabled']}</dd></div>
-          <div class="stat"><dt>Last checked</dt><dd>{safe.get('checked_at', 'never')}</dd></div>
+          <div class="stat"><dt>Survey enabled</dt><dd>{safe['survey_enabled']}</dd></div>
         </dl>
       </div>
     </section>
     <section class="grid">
       <div class="panel">
-        <h2 style="margin-top:0">Latest snapshot</h2>
-        <pre>{html.escape(json.dumps(snapshot, indent=2, sort_keys=True))}</pre>
+        <h2 style="margin-top:0">Latest check</h2>
+        <pre>{html.escape(json.dumps(check, indent=2, sort_keys=True))}</pre>
       </div>
+      <div class="panel">
+        <h2 style="margin-top:0">Latest survey</h2>
+        <pre>{html.escape(json.dumps(survey, indent=2, sort_keys=True))}</pre>
+      </div>
+    </section>
+    <section class="grid">
       <div class="panel">
         <h2 style="margin-top:0">Health</h2>
         <pre>{html.escape(json.dumps({{"ok": True, "status": snapshot.get("status", "idle")}}, indent=2, sort_keys=True))}</pre>
         <p class="foot">Health endpoint: <code>/health</code></p>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">Survey config</h2>
+        <pre>{html.escape(json.dumps({{"survey_url": snapshot.get("survey_url"), "survey_answers": survey.get("answers")}}, indent=2, sort_keys=True))}</pre>
       </div>
     </section>
   </main>
@@ -698,7 +927,8 @@ def make_handler(state: AppState, config: Config):
 
         def do_GET(self) -> None:  # noqa: N802
             snapshot = state.current()
-            data = format_snapshot(snapshot, config)
+            survey_snapshot = state.current_survey()
+            data = format_dashboard(snapshot, survey_snapshot, config)
             if self.path in {"/", "/index.html"}:
                 self._respond(200, "text/html; charset=utf-8", render_html(data))
                 return
@@ -730,11 +960,18 @@ def scheduler_loop(state: AppState, stop_event: threading.Event) -> None:
             break
         print(f"[checker] running at {local_now(config.tz).isoformat()}", flush=True)
         snapshot = run_check(config, state)
-        snapshot.next_check_at = next_run_at(local_now(config.tz), hour, minute, second).isoformat()
+        survey_snapshot = run_survey(config, state)
+        next_check = next_run_at(local_now(config.tz), hour, minute, second).isoformat()
+        snapshot.next_check_at = next_check
         state.save()
         print(
             f"[checker] status={snapshot.status} found={snapshot.found} "
             f"http_status={snapshot.http_status} url={snapshot.url}",
+            flush=True,
+        )
+        print(
+            f"[survey] status={survey_snapshot.status} http_status={survey_snapshot.http_status} "
+            f"url={survey_snapshot.submitted_url}",
             flush=True,
         )
 
@@ -746,7 +983,7 @@ def main() -> None:
 
     config = Config(
         postcode=postcode,
-        check_time=os.environ.get("CHECK_TIME", "09:00"),
+        check_time=os.environ.get("CHECK_TIME", "15:30"),
         timezone=os.environ.get("TZ", "Europe/London"),
         check_url_template=os.environ.get("CHECK_URL_TEMPLATE", DEFAULT_URL_TEMPLATE),
         entry_id=os.environ.get("ENTRY_ID", DEFAULT_ENTRY_ID),
@@ -761,6 +998,8 @@ def main() -> None:
         pushover_title=os.environ.get("PUSHOVER_TITLE", "Pick My Postcode").strip(),
         pushover_url=os.environ.get("PUSHOVER_URL", "").strip(),
         pushover_url_title=os.environ.get("PUSHOVER_URL_TITLE", "").strip(),
+        survey_url=os.environ.get("SURVEY_URL", DEFAULT_SURVEY_URL).strip(),
+        survey_answers=parse_json_map(os.environ.get("SURVEY_ANSWERS_JSON", DEFAULT_SURVEY_ANSWERS_JSON), "SURVEY_ANSWERS_JSON"),
     )
 
     state = AppState(config)
@@ -782,6 +1021,7 @@ def main() -> None:
         f"[startup] postcode={pretty_postcode(config.postcode)} "
         f"check_time={config.check_time} timezone={config.timezone} "
         f"url_template={config.check_url_template} entry_id={config.entry_id} "
+        f"survey={'on' if config.survey_answers else 'off'} "
         f"pushover={'on' if config.pushover_app_token and config.pushover_user_key else 'off'}",
         flush=True,
     )

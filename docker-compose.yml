@@ -20,6 +20,8 @@ services:
       PUSHOVER_TITLE: "${PUSHOVER_TITLE:-Pick My Postcode}"
       PUSHOVER_URL: "${PUSHOVER_URL:-}"
       PUSHOVER_URL_TITLE: "${PUSHOVER_URL_TITLE:-}"
+      SURVEY_URL: "${SURVEY_URL:-https://pickmypostcode.com/survey-draw/}"
+      SURVEY_ANSWERS_JSON: "${SURVEY_ANSWERS_JSON:-{\"radio-1\":\"neither\"}}"
       REQUEST_TIMEOUT: "${REQUEST_TIMEOUT:-20}"
       HTTP_PORT: "8080"
       STATE_PATH: "/data/state.json"
