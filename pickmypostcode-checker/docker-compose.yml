@@ -9,7 +9,7 @@ services:
     environment:
       POSTCODE: "${POSTCODE}"
       HOST_PORT: "${HOST_PORT:-8099}"
-      CHECK_TIME: "${CHECK_TIME:-09:00}"
+      CHECK_TIME: "${CHECK_TIME:-15:30}"
       TZ: "${TZ:-Europe/London}"
       ENTRY_ID: "${ENTRY_ID:-27079}"
       CHECK_URL_TEMPLATE: "${CHECK_URL_TEMPLATE:-https://pickmypostcode.com/api/index.php/entry/current/{entry_id}}"
