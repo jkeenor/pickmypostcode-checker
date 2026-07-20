@@ -5,9 +5,10 @@ services:
     container_name: pickmypostcode-checker
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "${HOST_PORT:-8099}:8080"
     environment:
       POSTCODE: "${POSTCODE}"
+      HOST_PORT: "${HOST_PORT:-8099}"
       CHECK_TIME: "${CHECK_TIME:-09:00}"
       TZ: "${TZ:-Europe/London}"
       ENTRY_ID: "${ENTRY_ID:-27079}"

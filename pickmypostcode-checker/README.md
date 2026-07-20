@@ -7,6 +7,7 @@ It watches the live Pick My Postcode current-draw API using a postcode you provi
 ## Stack env vars
 
 - `POSTCODE`: Your postcode to check.
+- `HOST_PORT`: Host port to expose the dashboard on. Default is `8099`.
 - `CHECK_TIME`: Daily check time in `HH:MM` or `HH:MM:SS`.
 - `TZ`: Timezone used for the schedule. Default is `Europe/London`.
 
