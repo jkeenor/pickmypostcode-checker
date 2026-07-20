@@ -40,6 +40,7 @@ The dashboard also surfaces the current main, survey, and video draw codes from 
 
 The login page on the site is a normal WordPress login, so it expects a username/email plus password. This checker does not need to log in to read the public current-draw data.
 
-If `PUSHOVER_APP_TOKEN` and `PUSHOVER_USER_KEY` are set, the container sends a Pushover notification the first time it sees your postcode in the current draw. It stores that notification signature in the persisted state volume so the same winning result does not trigger repeated alerts every day.
+If `PUSHOVER_APP_TOKEN` and `PUSHOVER_USER_KEY` are set, the container sends a Pushover notification when any matching draw result is found. It stores per-draw notification state in the persisted volume so the same winning result does not trigger repeated alerts on the same day.
+The container checks the main, survey, video, and stackpot draw results separately and can notify you for any of them when your postcode matches.
 
 The survey submission uses a simple GET form on the survey draw page. With the default `SURVEY_ANSWERS_JSON`, the app submits `radio-1=neither` once per day and stores the last successful submission in the state volume so it will not repeat within the same day.

@@ -182,9 +182,9 @@ class AppState:
         self.snapshot: CheckSnapshot | None = None
         self.survey_snapshot: SurveySnapshot | None = None
         self.last_raw_body: str = ""
-        self.last_notification_signature: str = ""
-        self.last_notification_at: str = ""
-        self.last_notification_error: str = ""
+        self.last_notification_signatures: dict[str, str] = {}
+        self.last_notification_ats: dict[str, str] = {}
+        self.last_notification_errors: dict[str, str] = {}
         self.last_survey_raw_body: str = ""
         self.last_survey_signature: str = ""
         self.last_survey_at: str = ""
@@ -204,9 +204,18 @@ class AppState:
             survey_snapshot = data.get("survey_snapshot")
             self.survey_snapshot = SurveySnapshot(**survey_snapshot) if survey_snapshot else None
             self.last_raw_body = data.get("last_raw_body", "")
-            self.last_notification_signature = data.get("last_notification_signature", "")
-            self.last_notification_at = data.get("last_notification_at", "")
-            self.last_notification_error = data.get("last_notification_error", "")
+            legacy_notification_signature = data.get("last_notification_signature", "")
+            legacy_notification_at = data.get("last_notification_at", "")
+            legacy_notification_error = data.get("last_notification_error", "")
+            self.last_notification_signatures = ensure_string_map(data.get("last_notification_signatures"))
+            self.last_notification_ats = ensure_string_map(data.get("last_notification_ats"))
+            self.last_notification_errors = ensure_string_map(data.get("last_notification_errors"))
+            if legacy_notification_signature and "main" not in self.last_notification_signatures:
+                self.last_notification_signatures["main"] = legacy_notification_signature
+            if legacy_notification_at and "main" not in self.last_notification_ats:
+                self.last_notification_ats["main"] = legacy_notification_at
+            if legacy_notification_error and "main" not in self.last_notification_errors:
+                self.last_notification_errors["main"] = legacy_notification_error
             self.last_survey_raw_body = data.get("last_survey_raw_body", "")
             self.last_survey_signature = data.get("last_survey_signature", "")
             self.last_survey_at = data.get("last_survey_at", "")
@@ -215,9 +224,9 @@ class AppState:
             self.snapshot = None
             self.survey_snapshot = None
             self.last_raw_body = ""
-            self.last_notification_signature = ""
-            self.last_notification_at = ""
-            self.last_notification_error = ""
+            self.last_notification_signatures = {}
+            self.last_notification_ats = {}
+            self.last_notification_errors = {}
             self.last_survey_raw_body = ""
             self.last_survey_signature = ""
             self.last_survey_at = ""
@@ -229,9 +238,12 @@ class AppState:
             "snapshot": asdict(self.snapshot) if self.snapshot else None,
             "survey_snapshot": asdict(self.survey_snapshot) if self.survey_snapshot else None,
             "last_raw_body": self.last_raw_body[-20000:],
-            "last_notification_signature": self.last_notification_signature,
-            "last_notification_at": self.last_notification_at,
-            "last_notification_error": self.last_notification_error,
+            "last_notification_signature": self.last_notification_signatures.get("main", ""),
+            "last_notification_at": self.last_notification_ats.get("main", ""),
+            "last_notification_error": self.last_notification_errors.get("main", ""),
+            "last_notification_signatures": self.last_notification_signatures,
+            "last_notification_ats": self.last_notification_ats,
+            "last_notification_errors": self.last_notification_errors,
             "last_survey_raw_body": self.last_survey_raw_body[-20000:],
             "last_survey_signature": self.last_survey_signature,
             "last_survey_at": self.last_survey_at,
@@ -345,6 +357,16 @@ def parse_json_map(value: str, env_name: str) -> dict[str, str]:
         if not isinstance(item, str):
             raise SystemExit(f"{env_name} must contain string values")
         result[key.strip()] = item.strip()
+    return result
+
+
+def ensure_string_map(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if isinstance(key, str) and isinstance(item, str):
+            result[key] = item
     return result
 
 
@@ -481,6 +503,38 @@ def extract_draw_results(payload: Any) -> dict[str, str]:
     return result_map
 
 
+def extract_stackpot_codes(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+
+    draw_results = data.get("drawResults")
+    if not isinstance(draw_results, dict):
+        return []
+
+    codes: list[str] = []
+    stackpot = draw_results.get("stackpot")
+    if not isinstance(stackpot, dict):
+        return []
+
+    result = stackpot.get("result")
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, str) and item.strip():
+                codes.append(item.strip())
+    elif isinstance(result, str) and result.strip():
+        codes.append(result.strip())
+
+    winningresult = stackpot.get("winningresult")
+    if isinstance(winningresult, str) and winningresult.strip():
+        codes.append(winningresult.strip())
+
+    return codes
+
+
 def render_html_excerpt(body: str, limit: int = 240) -> str:
     text = html_to_text(body)
     return make_excerpt(text, "", limit)
@@ -506,19 +560,38 @@ def survey_signature(snapshot: SurveySnapshot) -> str:
     )
 
 
-def send_pushover_notification(config: Config, snapshot: CheckSnapshot, state: AppState) -> None:
+def draw_notification_signature(draw_name: str, matched_value: str, postcode: str) -> str:
+    return "|".join([draw_name, normalize_postcode(postcode), normalize_postcode(matched_value)])
+
+
+def send_draw_notification(
+    config: Config,
+    snapshot: CheckSnapshot,
+    state: AppState,
+    *,
+    draw_name: str,
+    draw_label: str,
+    matched_value: str,
+) -> None:
     if not config.pushover_app_token or not config.pushover_user_key:
         return
-    if not snapshot.found:
-        return
 
-    signature = notification_signature(snapshot)
-    if state.last_notification_signature == signature:
+    signature = draw_notification_signature(draw_name, matched_value, snapshot.postcode)
+    attempted_at = datetime.fromisoformat(snapshot.checked_at)
+    last_signature = state.last_notification_signatures.get(draw_name, "")
+    last_at_raw = state.last_notification_ats.get(draw_name, "")
+    last_at = None
+    if last_at_raw:
+        try:
+            last_at = datetime.fromisoformat(last_at_raw)
+        except ValueError:
+            last_at = None
+    if last_signature == signature and last_at is not None and last_at.date() == attempted_at.date():
         return
 
     message = (
-        f"{pretty_postcode(snapshot.postcode)} matched the current Pick My Postcode draw.\n"
-        f"Current result: {snapshot.matched_text}\n"
+        f"{pretty_postcode(snapshot.postcode)} matched the {draw_label}.\n"
+        f"Winning code: {matched_value}\n"
         f"Checked at: {snapshot.checked_at}"
     )
     form = {
@@ -543,15 +616,65 @@ def send_pushover_notification(config: Config, snapshot: CheckSnapshot, state: A
             raise RuntimeError(f"HTTP {status}")
         if isinstance(payload, dict) and payload.get("status") != 1:
             raise RuntimeError(payload.get("errors") or payload.get("error") or "unknown error")
-        state.last_notification_signature = signature
-        state.last_notification_at = snapshot.checked_at
-        state.last_notification_error = ""
+        state.last_notification_signatures[draw_name] = signature
+        state.last_notification_ats[draw_name] = snapshot.checked_at
+        state.last_notification_errors[draw_name] = ""
         state.save()
-        print(f"[pushover] notification sent for {snapshot.pretty_postcode}", flush=True)
+        print(f"[pushover] notification sent for {draw_label} at {snapshot.pretty_postcode}", flush=True)
     except Exception as exc:
-        state.last_notification_error = str(exc)
+        state.last_notification_errors[draw_name] = str(exc)
         state.save()
-        print(f"[pushover] notification failed: {exc}", flush=True)
+        print(f"[pushover] notification failed for {draw_label}: {exc}", flush=True)
+
+
+def notify_matching_draws(config: Config, snapshot: CheckSnapshot, state: AppState, payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return
+
+    draw_results = data.get("drawResults")
+    if not isinstance(draw_results, dict):
+        return
+
+    postcode = normalize_postcode(config.postcode)
+    draw_map = (
+        ("main", "Main Draw"),
+        ("survey", "Survey Draw"),
+        ("video", "Video Draw"),
+    )
+
+    for key, label in draw_map:
+        entry = draw_results.get(key)
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        if not isinstance(result, str):
+            continue
+        matched = result.strip()
+        if matched and normalize_postcode(matched) == postcode:
+            send_draw_notification(
+                config,
+                snapshot,
+                state,
+                draw_name=key,
+                draw_label=label,
+                matched_value=matched,
+            )
+
+    for matched in extract_stackpot_codes(payload):
+        if normalize_postcode(matched) == postcode:
+            send_draw_notification(
+                config,
+                snapshot,
+                state,
+                draw_name="stackpot",
+                draw_label="Stackpot",
+                matched_value=matched,
+            )
+            break
 
 
 def run_survey(config: Config, state: AppState) -> SurveySnapshot:
@@ -674,6 +797,7 @@ def run_check(config: Config, state: AppState) -> CheckSnapshot:
     survey_result = ""
     video_result = ""
     stackpot_result = ""
+    payload: Any | None = None
 
     try:
         http_status, body = fetch_url(url, config.request_timeout)
@@ -738,8 +862,8 @@ def run_check(config: Config, state: AppState) -> CheckSnapshot:
         error=error,
     )
     state.update(snapshot, "" if error else body)
-    if error is None and snapshot.status == "results_present" and snapshot.found:
-        send_pushover_notification(config, snapshot, state)
+    if error is None and payload is not None:
+        notify_matching_draws(config, snapshot, state, payload)
     return snapshot
 
 
