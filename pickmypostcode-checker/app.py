@@ -155,6 +155,10 @@ class CheckSnapshot:
     status: str
     http_status: int | None
     next_check_at: str | None
+    main_result: str = ""
+    survey_result: str = ""
+    video_result: str = ""
+    stackpot_result: str = ""
     error: str | None = None
 
 
@@ -448,6 +452,35 @@ def render_json_excerpt(payload: Any) -> str:
     return json.dumps(summary, indent=2, sort_keys=True)
 
 
+def extract_draw_results(payload: Any) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+
+    draw_results = data.get("drawResults")
+    if not isinstance(draw_results, dict):
+        return {}
+
+    result_map: dict[str, str] = {}
+    for key in ("main", "survey", "video"):
+        entry = draw_results.get(key)
+        if isinstance(entry, dict):
+            result = entry.get("result")
+            if isinstance(result, str):
+                result_map[key] = result.strip()
+
+    stackpot = draw_results.get("stackpot")
+    if isinstance(stackpot, dict):
+        winningresult = stackpot.get("winningresult")
+        if isinstance(winningresult, str):
+            result_map["stackpot"] = winningresult.strip()
+
+    return result_map
+
+
 def render_html_excerpt(body: str, limit: int = 240) -> str:
     text = html_to_text(body)
     return make_excerpt(text, "", limit)
@@ -637,12 +670,21 @@ def run_check(config: Config, state: AppState) -> CheckSnapshot:
     status = "unknown"
     http_status: int | None = None
     error: str | None = None
+    main_result = ""
+    survey_result = ""
+    video_result = ""
+    stackpot_result = ""
 
     try:
         http_status, body = fetch_url(url, config.request_timeout)
         payload = parse_json_document(body)
         if isinstance(payload, dict):
             title = "Pick My Postcode current draw"
+            draw_results = extract_draw_results(payload)
+            main_result = draw_results.get("main", "")
+            survey_result = draw_results.get("survey", "")
+            video_result = draw_results.get("video", "")
+            stackpot_result = draw_results.get("stackpot", "")
             candidates = collect_current_results(payload)
             normalized_postcode = normalize_postcode(config.postcode)
             matches = [candidate for candidate in candidates if normalize_postcode(candidate) == normalized_postcode]
@@ -689,6 +731,10 @@ def run_check(config: Config, state: AppState) -> CheckSnapshot:
         status=status,
         http_status=http_status,
         next_check_at=None,
+        main_result=main_result,
+        survey_result=survey_result,
+        video_result=video_result,
+        stackpot_result=stackpot_result,
         error=error,
     )
     state.update(snapshot, "" if error else body)
@@ -734,6 +780,10 @@ def render_html(snapshot: dict[str, Any]) -> str:
         "survey_enabled": html.escape("" if snapshot.get("survey_enabled") is None else str(snapshot.get("survey_enabled"))),
         "survey_url": html.escape("" if snapshot.get("survey_url") is None else str(snapshot.get("survey_url"))),
         "next_check_at": html.escape("" if snapshot.get("next_check_at") is None else str(snapshot.get("next_check_at"))),
+        "main_result": html.escape("" if check.get("main_result") is None else str(check.get("main_result"))),
+        "survey_result": html.escape("" if check.get("survey_result") is None else str(check.get("survey_result"))),
+        "video_result": html.escape("" if check.get("video_result") is None else str(check.get("video_result"))),
+        "stackpot_result": html.escape("" if check.get("stackpot_result") is None else str(check.get("stackpot_result"))),
     }
     badge_class = {
         "error": "bad",
@@ -882,6 +932,10 @@ def render_html(snapshot: dict[str, Any]) -> str:
           <div class="stat"><dt>Entry ID</dt><dd>{safe['entry_id']}</dd></div>
           <div class="stat"><dt>Pushover</dt><dd>{safe['pushover_enabled']}</dd></div>
           <div class="stat"><dt>Survey enabled</dt><dd>{safe['survey_enabled']}</dd></div>
+          <div class="stat"><dt>Main draw code</dt><dd>{safe['main_result'] or 'pending'}</dd></div>
+          <div class="stat"><dt>Survey draw code</dt><dd>{safe['survey_result'] or 'pending'}</dd></div>
+          <div class="stat"><dt>Video draw code</dt><dd>{safe['video_result'] or 'pending'}</dd></div>
+          <div class="stat"><dt>Stackpot code</dt><dd>{safe['stackpot_result'] or 'pending'}</dd></div>
         </dl>
       </div>
     </section>

@@ -36,6 +36,7 @@ Optional overrides:
 ## Notes
 
 The default target uses the public current-draw API on Pick My Postcode. If the site changes its API path or draw id, you can change `CHECK_URL_TEMPLATE` or `ENTRY_ID` without changing the code.
+The dashboard also surfaces the current main, survey, and video draw codes from that same API response.
 
 The login page on the site is a normal WordPress login, so it expects a username/email plus password. This checker does not need to log in to read the public current-draw data.
 
